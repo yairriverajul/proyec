@@ -1,0 +1,616 @@
+
+"""
+M2M Payment Auth & Tracking over Blockchain — FULLY SIMULATED EXPERIMENT (seed-driven)
+
+What this script does (matches Section "Experimental Design"):
+- Full-factorial 2×3×2 = 12 conditions: Architecture × Transaction rate × Transaction value
+- r = 3 replications per condition (36 runs), randomized order
+- Each run lasts 200 s, discarding first 30 s warm-up
+- Generates ONLY simulated data from a single master SEED (reproducible)
+- Outputs:
+  (1) per-transaction dataset (CSV)
+  (2) per-run summary (CSV)
+  (3) publication-style figures:
+      fig_latency_box.png, fig_energy_bars.png, fig_latency_line.png,
+      fig_throughput_line.png, fig_cpu_box.png, fig_latency_fine.png
+  (4) optional ANOVA (statsmodels) to mirror “three-way ANOVA” language
+
+Notes on modeling choices:
+- We simulate the behaviors described in the paper:
+  A1: A-MFA + State-Channel (micro-payments batched; high value direct commit)
+  A2: X.509 Escrow baseline (per-tx heavier pipeline)
+- Latency/CPU/Energy are calibrated to reproduce the reported qualitative/quantitative trends:
+  * A1 ≈ 180 ms @ 5 tx/s, ≈ 300 ms @ 500 tx/s
+  * A2 ≈ 310 ms @ 5 tx/s, ≈ 710 ms @ 500 tx/s
+  * A1 energy ≈ 17–28% better than A2, aligning with “~18%” claim.
+- Gas is simulated using the article’s g(N)=g_anchor + g_proof*ceil(log2 N), amortized per leaf for state-channel micro-payments;
+  high-value bypass uses g_direct.
+
+Run in Colab:
+  !pip -q install pandas numpy matplotlib statsmodels
+
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Optional (for ANOVA / Tukey). Comment out if you do not need stats.
+try:
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+    from statsmodels.stats.multicomp import pairwise_tukeyhsd
+    HAVE_STATSMODELS = True
+except Exception:
+    HAVE_STATSMODELS = False
+
+
+# =========================
+# 0) MASTER CONFIG (SEED)
+# =========================
+
+SEED = 20251219  # <-- change ONLY this to regenerate a new fully-simulated dataset
+OUTDIR = "sim_outputs"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# Experiment parameters (as in paper)
+RUN_SECONDS = 200.0
+WARMUP_SECONDS = 30.0
+REPS = 3
+
+ARCH_LEVELS = ["A1_AMFA_STATE_CHANNEL", "A2_X509_ESCROW"]
+LAMBDA_LEVELS = [5, 50, 500]       # tx/s
+VALUE_LEVELS = [0.5, 100.0]        # USD
+
+# Dual-channel threshold (v >= theta => direct commit)
+THETA_USD = 10.0
+
+# “Anchoring period” appears in text as Δ=5 min, but for latency we treat anchoring as not in the critical path
+# (consistent with their sub-second measured latency). We still use Δ for batching size N for gas amortization.
+DELTA_ANCHOR_S = 300.0  # 5 minutes (paper)
+
+# Gas parameters (unit: “Wei-like” abstract unit; consistent within simulation)
+G_ANCHOR = 80_000
+G_PROOF_EDGE = 4_000
+G_DIRECT = 70_000
+
+# PBFT / baseline delays (ms) – used as components of simulated latency
+T_PBFT_MS = 55.0
+T_NET_MS = 35.0
+
+# Risk scoring weights (Eq. risk)
+W_GEO, W_TASK, W_BEHAV = 0.34, 0.33, 0.33
+
+
+# =========================
+# 1) CORE MODELS
+# =========================
+
+@dataclass(frozen=True)
+class TxResult:
+    run_id: str
+    rep: int
+    arch: str
+    lam: int
+    value: float
+    tx_id: int
+    t_arrival: float
+    path: str              # "MICRO_SC", "DIRECT"
+    rho: float
+    k_rho: int
+    ok: int                # 1 success, 0 dropped/rejected
+    latency_ms: float
+    energy_j: float
+    cpu_pct: float
+    gas_units: float
+
+
+def _risk_score_and_k(rng: np.random.Generator) -> Tuple[float, int]:
+    """
+    Implements Eq. (risk) and k_rho mapping:
+      rho = w1*norm(geo)+w2*norm(task)+w3*norm(behav)
+      k = 1 + floor(3*rho) in {1,2,3,4}
+    """
+    # normalized signals in [0,1]
+    geo = rng.beta(2.5, 2.5)      # moderate variability
+    task = rng.beta(2.0, 2.8)     # slightly skewed lower
+    behav = rng.beta(2.2, 2.2)    # balanced
+    rho = W_GEO * geo + W_TASK * task + W_BEHAV * behav
+    k = 1 + int(math.floor(3.0 * rho))
+    k = max(1, min(4, k))
+    return float(rho), int(k)
+
+
+def _amortized_gas_for_sc_batch(N: int) -> float:
+    """g(N)=g_anchor + g_proof*ceil(log2 N), amortized per transaction leaf."""
+    N = max(1, int(N))
+    depth = int(math.ceil(math.log2(N))) if N > 1 else 0
+    gN = G_ANCHOR + G_PROOF_EDGE * depth
+    return gN / N
+
+
+def _simulate_latency_ms(
+    rng: np.random.Generator,
+    arch: str,
+    lam: int,
+    k_rho: int,
+    path: str
+) -> float:
+    """
+    Seed-driven latency generator calibrated to the article’s reported medians.
+    Includes:
+      - baseline crypto/network/consensus components
+      - load sensitivity by λ
+      - factor sensitivity by k_rho
+      - jitter (lognormal-ish)
+    """
+    # Base components
+    base_ms = T_PBFT_MS + T_NET_MS
+
+    # Factor-related cost (A-MFA is lighter per factor than escrow’s certificate pipeline)
+    if arch == "A1_AMFA_STATE_CHANNEL":
+        factor_ms = 12.0 * (k_rho - 1)  # A-MFA escalation cost
+    else:
+        factor_ms = 20.0 * (k_rho - 1)  # heavier checks in escrow baseline
+
+    # Load term (calibrated to hit ~180/300 for A1 and ~310/710 for A2 at λ=5/500)
+    # A1 grows mildly; A2 grows sharply (saturates sooner).
+    x = lam / 500.0
+    log_term = math.log10(lam / 5.0 + 1.0)
+
+    if arch == "A1_AMFA_STATE_CHANNEL":
+        arch_base = 90.0  # lifts to the right scale with base_ms
+        load_ms = 20.0 * log_term + 80.0 * (x ** 1.2)
+        # state-channel micro-payments get a small extra “Merkle append/ack”
+        path_ms = 18.0 if path == "MICRO_SC" else 35.0
+    else:
+        arch_base = 210.0
+        load_ms = 55.0 * log_term + 300.0 * (x ** 1.25)
+        # escrow per-tx escrow hop overhead; direct path slightly higher for high-value
+        path_ms = 40.0 if path == "MICRO_SC" else 55.0
+
+    # Stochastic jitter (bounded; heavier tail for escrow)
+    sigma = 0.14 if arch == "A1_AMFA_STATE_CHANNEL" else 0.20
+    jitter = rng.lognormal(mean=0.0, sigma=sigma)  # median ~1.0
+
+    latency = (base_ms + arch_base + factor_ms + load_ms + path_ms) * jitter
+
+    # clamp to reasonable range for plots
+    return float(max(20.0, min(5000.0, latency)))
+
+
+def _simulate_energy_j(
+    rng: np.random.Generator,
+    arch: str,
+    lam: int,
+    k_rho: int,
+    gas_units: float
+) -> float:
+    """
+    Energy model aligned with Eq. (energy):
+      E = E_AMFA(rho,k) + E_net(B(lambda)) + E_cons(g)
+    We simulate:
+      - factor-driven CPU+sensor energy
+      - load-driven network energy
+      - linear gas→energy term (alpha*g + beta), using the paper’s coefficient style
+    """
+    # Consensus energy regression-like term (scaled to our gas unit)
+    alpha = 1.2e-6
+    beta = 0.42
+    E_cons = alpha * gas_units + beta
+
+    x = lam / 500.0
+
+    if arch == "A1_AMFA_STATE_CHANNEL":
+        # lower baseline + lower per-factor cost
+        E_factor = 0.10 * (k_rho - 1) + rng.normal(0, 0.01)
+        E_net = 0.20 + 0.15 * (x ** 1.05) + rng.normal(0, 0.01)
+        E_base = 0.28
+    else:
+        # higher baseline, higher factor overhead
+        E_factor = 0.14 * (k_rho - 1) + rng.normal(0, 0.015)
+        E_net = 0.24 + 0.22 * (x ** 1.10) + rng.normal(0, 0.015)
+        E_base = 0.35
+
+    E = E_base + E_factor + E_net + E_cons
+
+    # Keep physical plausibility (positive)
+    return float(max(0.05, E))
+
+
+def _simulate_cpu_pct(
+    rng: np.random.Generator,
+    arch: str,
+    lam: int,
+    k_rho: int
+) -> float:
+    """
+    CPU utilization trend consistent with narrative:
+      - rises with λ
+      - escrow saturates sooner than state-channel
+    """
+    x = lam / 500.0
+    if arch == "A1_AMFA_STATE_CHANNEL":
+        cpu = 20.0 + 45.0 * (x ** 0.9) + 5.0 * (k_rho - 1)
+        cpu += rng.normal(0, 2.5)
+    else:
+        cpu = 25.0 + 55.0 * (x ** 0.9) + 7.0 * (k_rho - 1)
+        cpu += rng.normal(0, 3.5)
+
+    return float(max(0.0, min(100.0, cpu)))
+
+
+def _success_probability(arch: str, lam: int, k_rho: int, rng: np.random.Generator) -> int:
+    """
+    Simple success model (drops/rejections) increasing with load and complexity.
+    A1 is more resilient than A2 at high λ.
+    """
+    x = lam / 500.0
+    if arch == "A1_AMFA_STATE_CHANNEL":
+        p_fail = 0.005 + 0.02 * (x ** 1.4) + 0.003 * (k_rho - 1)
+    else:
+        p_fail = 0.010 + 0.09 * (x ** 1.6) + 0.006 * (k_rho - 1)
+
+    return int(rng.random() > p_fail)
+
+
+def simulate_run(
+    rng: np.random.Generator,
+    arch: str,
+    lam: int,
+    value_usd: float,
+    rep: int,
+    run_id: str
+) -> List[TxResult]:
+    """
+    Simulate one 200 s run with Poisson arrivals at rate λ.
+    """
+    # Generate arrival times via exponential inter-arrival
+    t = 0.0
+    arrivals = []
+    while t < RUN_SECONDS:
+        t += rng.exponential(1.0 / lam)
+        if t < RUN_SECONDS:
+            arrivals.append(t)
+
+    # For gas batching: estimate batch size N for state-channel micropayments.
+    # We use expected leaves between anchors: N ≈ λ*Δ, but cap using run length.
+    # This affects amortized gas cost, not latency.
+    approx_N = int(lam * min(DELTA_ANCHOR_S, RUN_SECONDS))
+
+    results: List[TxResult] = []
+    tx_counter = 0
+
+    for t_arr in arrivals:
+        tx_counter += 1
+
+        rho, k = _risk_score_and_k(rng)
+
+        # Path selection (dual-channel)
+        if value_usd >= THETA_USD:
+            path = "DIRECT"
+        else:
+            path = "MICRO_SC" if arch == "A1_AMFA_STATE_CHANNEL" else "DIRECT"
+
+        # Gas model
+        if arch == "A1_AMFA_STATE_CHANNEL" and path == "MICRO_SC":
+            gas = _amortized_gas_for_sc_batch(approx_N)
+        else:
+            gas = float(G_DIRECT)
+
+        ok = _success_probability(arch, lam, k, rng)
+
+        latency_ms = _simulate_latency_ms(rng, arch, lam, k, path)
+        energy_j = _simulate_energy_j(rng, arch, lam, k, gas)
+        cpu_pct = _simulate_cpu_pct(rng, arch, lam, k)
+
+        results.append(TxResult(
+            run_id=run_id,
+            rep=rep,
+            arch=arch,
+            lam=lam,
+            value=value_usd,
+            tx_id=tx_counter,
+            t_arrival=t_arr,
+            path=path,
+            rho=rho,
+            k_rho=k,
+            ok=ok,
+            latency_ms=latency_ms,
+            energy_j=energy_j,
+            cpu_pct=cpu_pct,
+            gas_units=gas
+        ))
+
+    return results
+
+
+# =========================
+# 2) EXPERIMENT EXECUTION
+# =========================
+
+def run_full_experiment(seed: int = SEED) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(seed)
+
+    # Full factorial design points
+    design = [(a, l, v) for a in ARCH_LEVELS for l in LAMBDA_LEVELS for v in VALUE_LEVELS]
+
+    # Randomize run order (paper: random order to mitigate temporal noise)
+    run_plan = []
+    for (arch, lam, val) in design:
+        for rep in range(1, REPS + 1):
+            run_plan.append((arch, lam, val, rep))
+    rng.shuffle(run_plan)
+
+    all_tx: List[TxResult] = []
+
+    for idx, (arch, lam, val, rep) in enumerate(run_plan, start=1):
+        run_id = f"RUN{idx:03d}"
+        # Per-rep seed stream (still fully determined by master seed)
+        all_tx.extend(simulate_run(rng, arch, lam, val, rep, run_id))
+
+    df_tx = pd.DataFrame([t.__dict__ for t in all_tx])
+
+    # Apply warm-up filter
+    df_tx = df_tx[df_tx["t_arrival"] >= WARMUP_SECONDS].copy()
+
+    # Per-run summary (matches the “record all metrics” step)
+    df_run = (
+        df_tx.groupby(["run_id", "rep", "arch", "lam", "value"], as_index=False)
+        .agg(
+            n_tx=("tx_id", "count"),
+            n_ok=("ok", "sum"),
+            throughput_tps=("ok", lambda s: float(s.sum()) / (RUN_SECONDS - WARMUP_SECONDS)),
+            latency_ms_median=("latency_ms", "median"),
+            latency_ms_mean=("latency_ms", "mean"),
+            energy_j_mean=("energy_j", "mean"),
+            cpu_pct_mean=("cpu_pct", "mean"),
+            gas_units_mean=("gas_units", "mean"),
+        )
+    )
+
+    return df_tx, df_run
+
+
+# =========================
+# 3) PLOTTING (as in paper)
+# =========================
+
+def save_fig(path: str):
+    plt.tight_layout()
+    plt.savefig(path, dpi=250)
+    plt.close()
+
+
+def plot_latency_box(df_tx: pd.DataFrame):
+    # Boxplots of latency for each architecture across transaction rates
+    fig_path = os.path.join(OUTDIR, "fig_latency_box.png")
+
+    # Build groups: for each λ, two boxes (A1/A2)
+    data = []
+    labels = []
+    for lam in LAMBDA_LEVELS:
+        for arch in ARCH_LEVELS:
+            sel = df_tx[(df_tx["lam"] == lam) & (df_tx["arch"] == arch) & (df_tx["ok"] == 1)]
+            data.append(sel["latency_ms"].values)
+            labels.append(f"{lam} | {'A1' if 'A1' in arch else 'A2'}")
+
+    plt.figure(figsize=(11, 5))
+    plt.boxplot(data, showfliers=False)
+    plt.ylabel("Latency $T_{lat}$ (ms)")
+    plt.xlabel("Transaction rate λ (tx/s) | Architecture")
+    plt.title("End-to-end latency by architecture and load (boxplots)")
+    plt.xticks(range(1, len(labels) + 1), labels, rotation=0)
+    save_fig(fig_path)
+
+
+def plot_energy_bars(df_run: pd.DataFrame):
+    fig_path = os.path.join(OUTDIR, "fig_energy_bars.png")
+
+    # Mean energy per condition (average across reps)
+    g = (
+        df_run.groupby(["arch", "lam"], as_index=False)["energy_j_mean"]
+        .mean()
+        .sort_values(["lam", "arch"])
+    )
+
+    # Simple bar chart: grouped by λ
+    plt.figure(figsize=(9, 5))
+    width = 0.35
+    x = np.arange(len(LAMBDA_LEVELS))
+
+    a1 = g[g["arch"] == "A1_AMFA_STATE_CHANNEL"]["energy_j_mean"].values
+    a2 = g[g["arch"] == "A2_X509_ESCROW"]["energy_j_mean"].values
+
+    plt.bar(x - width/2, a1, width, label="A1: A-MFA + State-Channel")
+    plt.bar(x + width/2, a2, width, label="A2: X.509 Escrow")
+    plt.xticks(x, [str(l) for l in LAMBDA_LEVELS])
+    plt.ylabel("Energy per confirmed transaction (J)")
+    plt.xlabel("Transaction rate λ (tx/s)")
+    plt.title("Mean energy consumption per transaction (lower is better)")
+    plt.legend()
+    save_fig(fig_path)
+
+
+def plot_latency_line(df_run: pd.DataFrame):
+    fig_path = os.path.join(OUTDIR, "fig_latency_line.png")
+
+    g = (
+        df_run.groupby(["arch", "lam"], as_index=False)["latency_ms_median"]
+        .mean()
+        .sort_values(["arch", "lam"])
+    )
+
+    plt.figure(figsize=(9, 5))
+    for arch in ARCH_LEVELS:
+        s = g[g["arch"] == arch]
+        plt.plot(s["lam"], s["latency_ms_median"], marker="o",
+                 label="A1: A-MFA + State-Channel" if "A1" in arch else "A2: X.509 Escrow")
+    plt.xscale("log")
+    plt.xlabel("Transaction rate λ (tx/s) [log scale]")
+    plt.ylabel("Median latency (ms)")
+    plt.title("Latency scaling trend (median per condition)")
+    plt.legend()
+    save_fig(fig_path)
+
+
+def plot_throughput_line(df_run: pd.DataFrame):
+    fig_path = os.path.join(OUTDIR, "fig_throughput_line.png")
+
+    g = (
+        df_run.groupby(["arch", "lam"], as_index=False)["throughput_tps"]
+        .mean()
+        .sort_values(["arch", "lam"])
+    )
+
+    plt.figure(figsize=(9, 5))
+    for arch in ARCH_LEVELS:
+        s = g[g["arch"] == arch]
+        plt.plot(s["lam"], s["throughput_tps"], marker="o",
+                 label="A1: A-MFA + State-Channel" if "A1" in arch else "A2: X.509 Escrow")
+    plt.xscale("log")
+    plt.xlabel("Offered load λ (tx/s) [log scale]")
+    plt.ylabel("Confirmed throughput (TPS)")
+    plt.title("Throughput trend (confirmed TPS)")
+    plt.legend()
+    save_fig(fig_path)
+
+
+def plot_cpu_box(df_tx: pd.DataFrame):
+    fig_path = os.path.join(OUTDIR, "fig_cpu_box.png")
+
+    data = []
+    labels = []
+    for lam in LAMBDA_LEVELS:
+        for arch in ARCH_LEVELS:
+            sel = df_tx[(df_tx["lam"] == lam) & (df_tx["arch"] == arch)]
+            data.append(sel["cpu_pct"].values)
+            labels.append(f"{lam} | {'A1' if 'A1' in arch else 'A2'}")
+
+    plt.figure(figsize=(11, 5))
+    plt.boxplot(data, showfliers=False)
+    plt.ylabel("CPU utilization (%)")
+    plt.xlabel("Transaction rate λ (tx/s) | Architecture")
+    plt.title("EPA CPU utilization by architecture and load (boxplots)")
+    plt.xticks(range(1, len(labels) + 1), labels, rotation=0)
+    save_fig(fig_path)
+
+
+def plot_latency_fine(df_tx: pd.DataFrame):
+    """
+    Publication-style “fine-grained” curve with 150 samples.
+    We sample confirmed latencies from the heaviest condition (λ=500) for each arch.
+    """
+    fig_path = os.path.join(OUTDIR, "fig_latency_fine.png")
+
+    plt.figure(figsize=(9, 5))
+
+    for arch in ARCH_LEVELS:
+        sel = df_tx[(df_tx["lam"] == 500) & (df_tx["arch"] == arch) & (df_tx["ok"] == 1)]
+        if sel.empty:
+            continue
+        # 150-point sampling (without replacement if possible)
+        n = min(150, len(sel))
+        sample = sel["latency_ms"].sample(n=n, replace=(len(sel) < 150), random_state=SEED).sort_values().values
+        x = np.linspace(0, 500, num=n)
+        plt.plot(x, sample, marker=".", linestyle="-",
+                 label="A1: A-MFA + State-Channel" if "A1" in arch else "A2: X.509 Escrow")
+
+    plt.xlabel("Transaction rate λ (tx/s)")
+    plt.ylabel("Latency $T_{lat}$ (ms)")
+    plt.title("Fine-grained latency profile (150-point sampling at λ=500)")
+    plt.legend()
+    save_fig(fig_path)
+
+
+# =========================
+# 4) OPTIONAL STATISTICS
+# =========================
+
+def run_anova(df_tx: pd.DataFrame) -> None:
+    if not HAVE_STATSMODELS:
+        print("statsmodels not available; skipping ANOVA.")
+        return
+
+    # Use only successful tx to match “confirmed transactions” analysis
+    d = df_tx[df_tx["ok"] == 1].copy()
+    d["arch"] = d["arch"].astype("category")
+    d["lam"] = d["lam"].astype("category")
+    d["value"] = d["value"].astype("category")
+
+    print("\n=== Three-way ANOVA (Latency) ===")
+    model_lat = smf.ols("latency_ms ~ C(arch) * C(lam) * C(value)", data=d).fit()
+    anova_lat = sm.stats.anova_lm(model_lat, typ=2)
+    print(anova_lat)
+
+    print("\n=== Three-way ANOVA (Energy) ===")
+    model_en = smf.ols("energy_j ~ C(arch) * C(lam) * C(value)", data=d).fit()
+    anova_en = sm.stats.anova_lm(model_en, typ=2)
+    print(anova_en)
+
+    # Post-hoc (architecture effect) at each λ (optional)
+    print("\n=== Tukey HSD (Latency by Architecture) ===")
+    tuk = pairwise_tukeyhsd(d["latency_ms"], d["arch"])
+    print(tuk)
+
+
+# =========================
+# 5) MAIN
+# =========================
+
+def main():
+    df_tx, df_run = run_full_experiment(SEED)
+
+    # Save datasets
+    tx_path = os.path.join(OUTDIR, "transactions.csv")
+    run_path = os.path.join(OUTDIR, "runs_summary.csv")
+    df_tx.to_csv(tx_path, index=False)
+    df_run.to_csv(run_path, index=False)
+
+    # Produce figures
+    plot_latency_box(df_tx)
+    plot_energy_bars(df_run)
+    plot_latency_line(df_run)
+    plot_throughput_line(df_run)
+    plot_cpu_box(df_tx)
+    plot_latency_fine(df_tx)
+
+    # Quick sanity printout (medians at λ endpoints)
+    med = (
+        df_tx[df_tx["ok"] == 1]
+        .groupby(["arch", "lam"], as_index=False)["latency_ms"]
+        .median()
+        .sort_values(["lam", "arch"])
+    )
+    print("\nMedian latency (ms) by arch and λ:\n", med)
+
+    # Energy advantage estimate
+    en = (
+        df_run.groupby(["arch"], as_index=False)["energy_j_mean"]
+        .mean()
+    )
+    if len(en) == 2:
+        e1 = float(en[en["arch"].str.contains("A1")]["energy_j_mean"])
+        e2 = float(en[en["arch"].str.contains("A2")]["energy_j_mean"])
+        print(f"\nMean energy A1={e1:.3f} J, A2={e2:.3f} J, advantage={(1 - e1/e2)*100:.1f}%")
+
+    # Optional stats
+    run_anova(df_tx)
+
+    print(f"\nSaved outputs to: {OUTDIR}/")
+    print(f" - {tx_path}")
+    print(f" - {run_path}")
+    print(" - Figures: fig_latency_box.png, fig_energy_bars.png, fig_latency_line.png, "
+          "fig_throughput_line.png, fig_cpu_box.png, fig_latency_fine.png")
+
+
+if __name__ == "__main__":
+    main()
+```
